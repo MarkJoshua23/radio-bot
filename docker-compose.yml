@@ -5,6 +5,7 @@ services:
     build: .
     container_name: discord-radio-bot
     restart: always
+    network_mode: host
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - STREAM_URL=${STREAM_URL}

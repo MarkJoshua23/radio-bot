@@ -111,6 +111,7 @@ function startSharedStream(url) {
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
     '-i', url,
+    '-af', 'aresample=async=1',
     '-f', 's16le',
     '-ar', '48000',
     '-ac', '2',
