@@ -167,6 +167,106 @@ function stopSharedStream() {
   sharedResource = null;
 }
 
+// Robust connection and auto-rejoin helper
+async function connectToVoice(guildId, channelId, adapterCreator) {
+  // If an existing connection tracking entry exists for this guild, mark manual disconnect so old listeners don't collide
+  const existing = activeConnections.get(guildId);
+  if (existing && existing.connection) {
+    existing.isManualDisconnect = true;
+    try { existing.connection.destroy(); } catch (e) {}
+  }
+
+  const connectionData = {
+    connection: null,
+    channelId,
+    adapterCreator,
+    isManualDisconnect: false,
+  };
+
+  const connection = joinVoiceChannel({
+    channelId: channelId,
+    guildId: guildId,
+    adapterCreator: adapterCreator,
+  });
+
+  connectionData.connection = connection;
+  activeConnections.set(guildId, connectionData);
+
+  connection.on('stateChange', async (oldState, newState) => {
+    console.log(`[Connection StateChange] Guild: ${guildId} | ${oldState.status} -> ${newState.status}`);
+    
+    if (newState.status === VoiceConnectionStatus.Disconnected) {
+      console.log(`Connection disconnected in guild: ${guildId}`);
+
+      if (connectionData.isManualDisconnect) {
+        return; // Manual disconnect initiated by user or replacement
+      }
+
+      // Try waiting up to 5 seconds for Discord automatic voice server migration or auto-reconnect
+      try {
+        await Promise.race([
+          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+        ]);
+        console.log(`Connection auto-recovering in guild: ${guildId}`);
+        return; // Auto-recovery succeeded
+      } catch (e) {
+        // Auto-recovery timed out
+      }
+
+      if (connectionData.isManualDisconnect) return;
+
+      console.log(`Connection recovery timed out in guild: ${guildId}. Cleaning up old connection...`);
+      try {
+        connection.destroy();
+      } catch (e) {}
+
+      scheduleAutoRejoin(guildId, channelId, adapterCreator);
+    }
+  });
+
+  // Wait for the connection to become Ready
+  console.log(`Connecting to voice channel in guild: ${guildId}...`);
+  await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+  console.log(`Connection ready in guild: ${guildId}! Subscribing player.`);
+
+  // Subscribe to shared player
+  connection.subscribe(sharedPlayer);
+
+  // Ensure stream is running
+  startSharedStream(streamUrl);
+
+  return connection;
+}
+
+function scheduleAutoRejoin(guildId, channelId, adapterCreator) {
+  const current = activeConnections.get(guildId);
+  if (current && current.isManualDisconnect) {
+    return; // Don't rejoin if user manually disconnected
+  }
+
+  console.log(`Scheduling auto-rejoin for guild: ${guildId} in 5 seconds...`);
+  setTimeout(async () => {
+    const entry = activeConnections.get(guildId);
+    if (entry && entry.isManualDisconnect) {
+      console.log(`Auto-rejoin cancelled for guild: ${guildId} due to manual disconnect.`);
+      return;
+    }
+
+    try {
+      console.log(`Attempting auto-rejoin in guild: ${guildId}...`);
+      await connectToVoice(guildId, channelId, adapterCreator);
+      console.log(`Successfully auto-rejoined voice channel in guild: ${guildId}!`);
+    } catch (err) {
+      console.error(`Auto-rejoin failed for guild: ${guildId}:`, err.message);
+      const reCheck = activeConnections.get(guildId);
+      if (!reCheck || !reCheck.isManualDisconnect) {
+        scheduleAutoRejoin(guildId, channelId, adapterCreator);
+      }
+    }
+  }, 5000);
+}
+
 // On Ready
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}!`);
@@ -204,42 +304,7 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferReply();
 
     try {
-      // Join the voice channel first
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: guildId,
-        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-      });
-
-      // Listen to connection state changes for debugging and cleanup
-      connection.on('stateChange', (oldState, newState) => {
-        console.log(`[Connection StateChange] Guild: ${guildId} | ${oldState.status} -> ${newState.status}`);
-        if (newState.status === 'disconnected') {
-          console.log(`Connection disconnected in guild: ${guildId}`);
-          try {
-            connection.destroy();
-          } catch (e) {}
-          activeConnections.delete(guildId);
-
-          if (activeConnections.size === 0) {
-            console.log('All connections closed. Stopping shared stream.');
-            stopSharedStream();
-          }
-        }
-      });
-
-      // Wait for the connection to become Ready
-      console.log(`Connecting to voice channel in guild: ${guildId}...`);
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-      console.log(`Connection ready in guild: ${guildId}! Subscribing player.`);
-
-      // Subscribe to the shared player
-      connection.subscribe(sharedPlayer);
-      activeConnections.set(guildId, connection);
-
-      // Now ensure shared stream is running (since connection is active and ready)
-      startSharedStream(streamUrl);
-
+      await connectToVoice(guildId, voiceChannel.id, voiceChannel.guild.voiceAdapterCreator);
       await interaction.editReply(`Joined **${voiceChannel.name}** and started streaming the radio!`);
     } catch (error) {
       console.error('Error joining voice channel:', error);
@@ -249,18 +314,25 @@ client.on('interactionCreate', async (interaction) => {
 
   if (commandName === 'disconnect') {
     const guildId = interaction.guildId;
-    const connection = activeConnections.get(guildId) || getVoiceConnection(guildId);
+    const connectionData = activeConnections.get(guildId);
 
     console.log(`User ${interaction.user.tag} (${interaction.user.id}) ran /disconnect in guild: ${interaction.guild.name} (${guildId})`);
 
-    if (!connection) {
+    const connection = connectionData ? connectionData.connection : getVoiceConnection(guildId);
+
+    if (!connection && !connectionData) {
       return interaction.reply({ content: 'I am not connected to a voice channel in this server!', ephemeral: true });
     }
 
     await interaction.deferReply();
 
     try {
-      connection.destroy();
+      if (connectionData) {
+        connectionData.isManualDisconnect = true;
+      }
+      if (connection) {
+        try { connection.destroy(); } catch (e) {}
+      }
       activeConnections.delete(guildId);
 
       if (activeConnections.size === 0) {
@@ -280,8 +352,11 @@ client.on('interactionCreate', async (interaction) => {
 process.on('SIGINT', () => {
   console.log('Shutting down bot...');
   stopSharedStream();
-  for (const connection of activeConnections.values()) {
-    connection.destroy();
+  for (const item of activeConnections.values()) {
+    if (item && item.connection) {
+      item.isManualDisconnect = true;
+      try { item.connection.destroy(); } catch (e) {}
+    }
   }
   client.destroy();
   process.exit(0);
